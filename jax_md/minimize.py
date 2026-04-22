@@ -31,12 +31,13 @@ apply_fn:
   step of optimization.
 """
 
-from typing import TypeVar, Callable, Tuple, Union, Any
+from typing import TypeVar, Callable, Tuple, Union, Optional, Mapping, Any
 
 import jax
 import jax.numpy as jnp
 from jax.scipy.sparse.linalg import cg
 from jax.tree_util import tree_leaves, tree_map, tree_reduce
+import optax
 
 from jax_md import quantity
 from jax_md import dataclasses
@@ -53,6 +54,7 @@ f32 = util.f32
 f64 = util.f64
 
 ShiftFn = space.ShiftFn
+NeighborFn = Any  # TODO: Change this
 
 T = TypeVar('T')
 InitFn = Callable[..., T]
@@ -1361,5 +1363,109 @@ def precon_fire_descent_box(
       precon_previous_R,
       precon_previous_initialized,
     )  # pytype: disable=wrong-arg-count
+
+class OptaxMinimizerState:
+  position: Array
+  opt_state: optax.OptState
+  step: Array
+  value: Array
+  grad: Array
+  neighbor_fn: Optional[NeighborFn]
+
+
+def optax_descent(
+  energy_fn: Callable[..., Array],
+  tx: optax.GradientTransformation | optax.GradientTransformationExtraArgs,
+  neighbor_fn: Optional[NeighborFn] = None,
+) -> Minimizer[OptaxMinimizerState]:
+  """Defines minimization using a user-provided Optax transformation.
+
+  Args:
+    energy_fn: Energy function to minimize.
+    shift_fn: Position update function (e.g. from a periodic space).
+    tx: Any Optax gradient transformation or chain.
+    extra_args_fn: Optional callback returning extra keyword arguments passed to
+      ``tx.update``. Signature:
+      ``extra_args_fn(state, value, grad, energy_kwargs) -> Mapping[str, Any]``.
+
+  Returns:
+    ``(init_fn, apply_fn)`` pair.
+  """
+  tx: optax.GradientTransformationExtraArgs = optax.with_extra_args_support(tx)
+  value_and_grad_fn = jax.value_and_grad(energy_fn)
+
+  def init_fn(R: Array, **kwargs) -> OptaxMinimizerState:
+    nonlocal neighbor_fn
+    if neighbor_fn is not None:
+      neighbor_fn = neighbor_fn.allocate(R)
+      value, grad = value_and_grad_fn(R, neighbor=neighbor_fn, **kwargs)
+    else:
+      value, grad = value_and_grad_fn(R, **kwargs)
+    return OptaxMinimizerState(
+      position=R,
+      opt_state=tx.init(R),
+      step=jnp.zeros((), jnp.int32),
+      value=value,
+      grad=grad,
+      neighbor_fn=neighbor_fn,
+    )
+
+  if neighbor_fn is None:
+    # Non-neighbor branch
+    def apply_fn(
+      state: OptaxMinimizerState,
+      **kwargs,
+    ) -> OptaxMinimizerState:
+      value, grad = value_and_grad_fn(state.position, **kwargs)
+
+      def value_fn(position: Array) -> Array:
+        return energy_fn(position, **kwargs)
+
+      extra_args = {'value': value, 'grad': grad, 'value_fn': value_fn}
+
+      updates, opt_state = tx.update(
+        grad, state.opt_state, state.position, **extra_args
+      )
+      position = optax.apply_updates(state.position, updates)
+
+      return OptaxMinimizerState(
+        position=position,
+        opt_state=opt_state,
+        step=state.step + jnp.array(1, state.step.dtype),
+        value=value,
+        grad=grad,
+        neighbor_fn=None,
+      )
+  else:
+
+    def apply_fn(
+      state: OptaxMinimizerState,
+      **kwargs,
+    ) -> OptaxMinimizerState:
+      value, grad = value_and_grad_fn(
+        state.position, neighbor=state.neighbor_fn, **kwargs
+      )
+
+      def value_fn(position: Array) -> Array:
+        return energy_fn(
+          position, neighbor=state.neighbor_fn.update(position), **kwargs
+        )
+
+      extra_args = {'value': value, 'grad': grad, 'value_fn': value_fn}
+
+      updates, opt_state = tx.update(
+        grad, state.opt_state, state.position, **extra_args
+      )
+      position = optax.apply_updates(state.position, updates)
+      neighbor_fn = state.neighbor_fn.update(position)
+
+      return OptaxMinimizerState(
+        position=position,
+        opt_state=opt_state,
+        step=state.step + jnp.array(1, state.step.dtype),
+        value=value,
+        grad=grad,
+        neighbor_fn=neighbor_fn,
+      )
 
   return init_fn, apply_fn
