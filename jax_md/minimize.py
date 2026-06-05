@@ -1364,6 +1364,8 @@ def precon_fire_descent_box(
       precon_previous_initialized,
     )  # pytype: disable=wrong-arg-count
 
+
+@dataclasses.dataclass
 class OptaxMinimizerState:
   position: Array
   opt_state: optax.OptState
@@ -1469,3 +1471,116 @@ def optax_descent(
       )
 
   return init_fn, apply_fn
+
+
+@dataclasses.dataclass
+class LBFGSState:
+  """State for the L-BFGS minimizer.
+
+  Attributes:
+    position: The current position. An ndarray of floats with shape
+      `[n, spatial_dimension]`.
+    energy: The energy at `position`. A scalar.
+    force: The force (`-dE/dposition`) at `position`. Same shape as `position`.
+    s_history: Ring buffer of position differences `s_k = R_{k+1} - R_k`. An
+      ndarray with shape `[memory_size, n, spatial_dimension]`.
+    y_history: Ring buffer of gradient differences `y_k = g_{k+1} - g_k`. Same
+      shape as `s_history`.
+    rho: Ring buffer of `1 / (y_k . s_k)`. An ndarray with shape `[memory_size]`.
+    length: The number of valid entries currently stored in the history.
+    step: The number of steps taken.
+  """
+
+  position: Array
+  energy: Array
+  force: Array
+  s_history: Array
+  y_history: Array
+  rho: Array
+  length: Array
+  step: Array
+
+
+def lbfgs(
+  energy_or_force: Callable[..., Array],
+  shift_fn: ShiftFn,
+  memory_size: int = 10,
+) -> Minimizer[LBFGSState]:
+  """Defines L-BFGS minimization.
+
+  The limited-memory BFGS method approximates the action of the inverse Hessian
+  from the most recent `memory_size` position/gradient differences and takes a
+  line-searched step along the resulting quasi-Newton direction. Because the
+  line search needs energies, `energy_or_force` must be an energy function.
+
+  Follows the same structure as the other minimizers in this module: positions
+  are updated with `shift_fn`, and any extra keyword arguments (e.g. a `neighbor`
+  list or a `graph`) are threaded through to both `energy_or_force` and
+  `shift_fn`.
+
+  Args:
+    energy_or_force: A function that produces an energy from a set of particle
+      positions specified as an ndarray of shape `[n, spatial_dimension]`.
+    shift_fn: A function that displaces positions `R` by an amount `dR`. Both
+      `R` and `dR` should be ndarrays of shape `[n, spatial_dimension]`.
+    memory_size: The number of correction pairs to store.
+
+  Returns:
+    See above.
+  """
+  force_fn = quantity.canonicalize_force(energy_or_force)
+  energy_fn = energy_or_force
+
+  def init_fn(R: Array, **kwargs) -> LBFGSState:
+    zeros = jnp.zeros((memory_size,) + R.shape, R.dtype)
+    return LBFGSState(
+      position=R,
+      energy=energy_fn(R, **kwargs),
+      force=force_fn(R, **kwargs),
+      s_history=zeros,
+      y_history=zeros,
+      rho=jnp.zeros((memory_size,), R.dtype),
+      length=jnp.zeros((), jnp.int32),
+      step=jnp.zeros((), jnp.int32),
+    )  # pytype: disable=wrong-arg-count
+
+  def apply_fn(state: LBFGSState, **kwargs) -> LBFGSState:
+    return lbfgs_update(state, force_fn, energy_fn, shift_fn, **kwargs)
+
+  return init_fn, apply_fn
+
+
+def lbfgs_update(
+  state: LBFGSState,
+  force_fn: Callable[..., Array],
+  energy_fn: Callable[..., Array],
+  shift_fn: ShiftFn,
+  **kwargs,
+) -> LBFGSState:
+  """Performs a single L-BFGS step. [TO IMPLEMENT]
+
+  This is the core of the optimizer and is intentionally left unimplemented. A
+  step should:
+
+    1. Compute the search direction by applying the two-loop recursion to
+       `state.force` (`= -gradient`) using `state.s_history`, `state.y_history`,
+       `state.rho` and `state.length`.
+    2. Choose a step length along that direction with a line search, evaluating
+       trial points with `energy_fn(R, **kwargs)` / `force_fn(R, **kwargs)` and
+       moving positions with `shift_fn(R, dR, **kwargs)`.
+    3. Return a new `LBFGSState` with the updated position, refreshed
+       `energy`/`force`, the new `(s, y, rho)` pair appended to the ring buffers,
+       `length` incremented (capped at `memory_size`) and `step + 1`.
+
+  Args:
+    state: The current `LBFGSState`.
+    force_fn: `force_fn(R, **kwargs) -> -dE/dR`.
+    energy_fn: `energy_fn(R, **kwargs) -> scalar energy`.
+    shift_fn: `shift_fn(R, dR, **kwargs) -> R'`.
+    **kwargs: Extra arguments threaded to `force_fn`/`energy_fn`/`shift_fn`
+      (e.g. a `neighbor` list or a `graph`).
+
+  Returns:
+    The next `LBFGSState`.
+  """
+  raise NotImplementedError('Implement the L-BFGS step.')
